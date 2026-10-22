@@ -19,6 +19,7 @@ Note:
   results as real foundation predictions.
 """
 
+import argparse
 import gmsh
 import numpy as np
 from mpi4py import MPI
@@ -27,6 +28,39 @@ import ufl
 from dolfinx import fem, io, mesh
 from dolfinx.io import gmsh as dolfinx_gmsh
 from dolfinx.fem.petsc import LinearProblem
+
+parser = argparse.ArgumentParser(
+    description="Run the GEOFLUX 3D foundation FEM simulation."
+)
+parser.add_argument(
+    "--dry-density",
+    type=float,
+    help="Measured dry soil density [kg/m^3]; required with --water-content.",
+)
+parser.add_argument(
+    "--water-content",
+    type=float,
+    help=(
+        "Measured gravimetric soil water content [%]; required with "
+        "--dry-density."
+    ),
+)
+args = parser.parse_args()
+
+if (args.dry_density is None) != (args.water_content is None):
+    parser.error(
+        "--dry-density and --water-content must be provided together."
+    )
+if args.dry_density is not None and (
+    not np.isfinite(args.dry_density)
+    or args.dry_density <= 0
+    or not np.isfinite(args.water_content)
+    or args.water_content < 0
+):
+    parser.error(
+        "Dry density must be finite and greater than zero; water content "
+        "must be finite and non-negative."
+    )
 
 # -------------------- MPI --------------------
 
@@ -71,6 +105,7 @@ LOAD_C = 10.0
 # Mesh sizes in metres
 MESH_SIZE_SOIL = 0.035
 MESH_SIZE_CONC = 0.018
+GRAVITY_M_S2 = 9.80665
 
 # -------------------- VALIDATE GEOMETRY --------------------
 
@@ -443,6 +478,14 @@ for cell, tag in zip(
         E_field.x.array[dof] = E_CONC
         nu_field.x.array[dof] = NU_CONC
 
+# Optional moisture-informed soil self-weight. Water content is gravimetric,
+# so bulk density is dry density multiplied by (1 + water_content).
+bulk_density_kg_m3 = (
+    args.dry_density * (1 + args.water_content / 100)
+    if args.dry_density is not None
+    else None
+)
+
 # Lamé parameters
 mu = E_field / (
     2.0 * (1.0 + nu_field)
@@ -608,6 +651,20 @@ for tag, force in load_map.items():
         traction, v
     ) * ds(tag)
 
+if bulk_density_kg_m3 is not None:
+    dx = ufl.Measure(
+        "dx",
+        domain=domain,
+        subdomain_data=cell_tags,
+    )
+    body_force = fem.Constant(
+        domain,
+        PETSc.ScalarType(
+            (0.0, 0.0, -bulk_density_kg_m3 * GRAVITY_M_S2)
+        ),
+    )
+    L += ufl.dot(body_force, v) * dx(1)
+
 # ============================================================
 # SOLVE LINEAR ELASTICITY
 # ============================================================
@@ -689,6 +746,18 @@ if rank == 0:
         f"Columns: {COL_W:.2f} x "
         f"{COL_W:.2f} x {COL_H:.2f} m"
     )
+
+    if bulk_density_kg_m3 is not None:
+        print(
+            f"Soil water content: {args.water_content:.2f}% "
+            f"(gravimetric)"
+        )
+        print(
+            f"Soil bulk density: {bulk_density_kg_m3:.1f} kg/m^3; "
+            "soil self-weight included"
+        )
+    else:
+        print("Soil self-weight omitted (no moisture/density inputs supplied).")
 
     print(
         f"Maximum vertical settlement: "
